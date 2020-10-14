@@ -17,11 +17,15 @@
  *******************************************************************************/
 package org.eclipse.jdt.ls.core.internal.corrections.proposals;
 
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.Objects;
 
+import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.jdt.core.Flags;
 import org.eclipse.jdt.core.ICompilationUnit;
@@ -49,8 +53,14 @@ import org.eclipse.jdt.internal.core.manipulation.StubUtility;
 import org.eclipse.jdt.internal.core.manipulation.util.BasicElementLabels;
 import org.eclipse.jdt.internal.corext.dom.ASTNodes;
 import org.eclipse.jdt.internal.corext.dom.IASTSharedValues;
+import org.eclipse.jdt.internal.corext.fix.AddUnimplementedMethodsOperation;
+import org.eclipse.jdt.internal.corext.fix.CompilationUnitRewriteOperationsFixCore.CompilationUnitRewriteOperation;
+import org.eclipse.jdt.internal.corext.fix.IProposableFix;
+import org.eclipse.jdt.internal.corext.fix.UnimplementedCodeFixCore;
 import org.eclipse.jdt.internal.corext.util.JavaModelUtil;
 import org.eclipse.jdt.internal.corext.util.Messages;
+import org.eclipse.jdt.ls.core.internal.JDTUtils;
+import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
 import org.eclipse.jdt.ls.core.internal.corext.refactoring.nls.changes.CreateFileChange;
 import org.eclipse.jdt.ls.core.internal.corrections.CorrectionMessages;
 import org.eclipse.lsp4j.CodeActionKind;
@@ -276,6 +286,7 @@ public class NewCUProposal extends ChangeCorrectionProposal {
 			CompositeChange change = new CompositeChange(fName);
 			change.add(new CreateFileChange(targetType.getResource().getRawLocation(), "", ""));
 			change.add(constructNewCUChange(parentCU));
+
 			return change;
 		} else {
 			return null;
@@ -353,6 +364,35 @@ public class NewCUProposal extends ChangeCorrectionProposal {
 		String lineDelimiter = StubUtility.getLineDelimiterUsed(fCompilationUnit.getJavaProject());
 		String typeStub = constructTypeStub(cu, fTypeNameWithParameters, Flags.AccPublic, lineDelimiter);
 		String cuContent = constructCUContent(cu, typeStub, lineDelimiter);
+
+		IType cuType = fCompilationUnit.findPrimaryType();
+		String[] permittedNames = cuType.getPermittedSubtypeNames();
+		boolean isPermitted = Arrays.asList(permittedNames).stream().anyMatch(p -> fTypeNameWithParameters.equals(p));
+
+		if (isPermitted) {
+			IProject fakeProj = JavaLanguageServerPlugin.getProjectsManager().getDefaultProject();
+			IFile fakeFile = fakeProj.getFile(cu.getPath());
+			InputStream is = new ByteArrayInputStream(new byte[0]);
+			fakeFile.create(is, false, null);
+
+			ICompilationUnit fakeCU = JDTUtils.getFakeCompilationUnit(fakeFile.getLocationURI().toString());
+
+			fakeCU.createType(typeStub, null, false, null);
+			ASTParser parser = ASTParser.newParser(IASTSharedValues.SHARED_AST_LEVEL);
+			parser.setSource(fakeCU);
+			parser.setResolveBindings(true);
+			CompilationUnit cuRoot = (CompilationUnit) parser.createAST(null);
+
+			AddUnimplementedMethodsOperation operation = new AddUnimplementedMethodsOperation((ASTNode) cuRoot.types().get(0));
+			if (operation.getMethodsToImplement().length > 0) {
+				IProposableFix fix = new UnimplementedCodeFixCore(CorrectionMessages.UnimplementedMethodsCorrectionProposal_description, cuRoot, new CompilationUnitRewriteOperation[] { operation });
+				CompilationUnitChange addChange = fix.createChange(null);
+				cuContent = addChange.getPreviewContent(null);
+			}
+
+			fakeCU.delete(true, null);
+		}
+
 		CompilationUnitChange cuChange = new CompilationUnitChange("", cu);
 		cuChange.setEdit(new InsertEdit(0, cuContent));
 		return cuChange;
